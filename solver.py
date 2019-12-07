@@ -10,10 +10,71 @@ import torch.nn.functional as F
 from evaluation import *
 from network import U_Net,R2U_Net,AttU_Net,R2AttU_Net
 import csv
+from crf import dense_crf
+from PIL import Image
+
+
+def ohem_single(score, gt_text, training_mask):
+    pos_num = (int)(np.sum(gt_text > 0.5)) - (int)(np.sum((gt_text > 0.5) & (training_mask <= 0.5)))
+    
+    if pos_num == 0:
+        # selected_mask = gt_text.copy() * 0 # may be not good
+        selected_mask = training_mask
+        selected_mask = selected_mask.reshape(1, selected_mask.shape[0], selected_mask.shape[1]).astype('float32')
+        return selected_mask
+    
+    neg_num = (int)(np.sum(gt_text <= 0.5))
+    neg_num = (int)(min(pos_num * 3, neg_num))
+    
+    if neg_num == 0:
+        selected_mask = training_mask
+        selected_mask = selected_mask.reshape(1, selected_mask.shape[0], selected_mask.shape[1]).astype('float32')
+        return selected_mask
+
+    neg_score = score[gt_text <= 0.5]
+    neg_score_sorted = np.sort(-neg_score)
+    threshold = -neg_score_sorted[neg_num - 1]
+
+    selected_mask = ((score >= threshold) | (gt_text > 0.5)) & (training_mask > 0.5)
+    selected_mask = selected_mask.reshape(1, selected_mask.shape[0], selected_mask.shape[1]).astype('float32')
+    return selected_mask
+
+def ohem_batch(scores, gt_texts, training_masks):
+    #gt_text = gt_text.transpose((1,2,0))
+    #gt_text = gt_text.pemute(1,2,0)
+    scores = scores.data.cpu().numpy()
+    gt_texts = gt_texts.data.cpu().numpy()
+    training_masks = training_masks.data.cpu().numpy()
+
+    selected_masks = []
+    for i in range(scores.shape[0]):
+        selected_masks.append(ohem_single(scores[i, :, :], gt_texts[i, :, :], training_masks[i, :, :]))
+
+    selected_masks = np.concatenate(selected_masks, 0)
+    selected_masks = torch.from_numpy(selected_masks).float()
+
+    return selected_masks
+
+def dice_loss(input, target, mask):
+    input = torch.sigmoid(input)
+
+    input = input.contiguous().view(input.size()[0], -1)
+    target = target.contiguous().view(target.size()[0], -1)
+    mask = mask.contiguous().view(mask.size()[0], -1)
+    
+    input = input * mask
+    target = target * mask
+
+    a = torch.sum(input * target, 1)
+    b = torch.sum(input * input, 1) + 0.001
+    c = torch.sum(target * target, 1) + 0.001
+    d = (2 * a) / (b + c)
+    dice_loss = torch.mean(d)
+    return 1 - dice_loss
 
 
 class Solver(object):
-	def __init__(self, config, train_loader, valid_loader, test_loader):
+	def __init__(self, config, train_loader, valid_loader = [], test_loader = []):
 
 		# Data loader
 		self.train_loader = train_loader
@@ -47,7 +108,7 @@ class Solver(object):
 		self.result_path = config.result_path
 		self.mode = config.mode
 
-		self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+		self.device = torch.device('cuda:{0}'.format(config.gpu_id) if config.gpu_id != -1 and torch.cuda.is_available() else 'cpu')
 		self.model_type = config.model_type
 		self.t = config.t
 		self.build_model()
@@ -111,8 +172,8 @@ class Solver(object):
 		#====================================== Training ===========================================#
 		#===========================================================================================#
 		
-		unet_path = os.path.join(self.model_path, '%s-%d-%.4f-%d-%.4f.pkl' %(self.model_type,self.num_epochs,self.lr,self.num_epochs_decay,self.augmentation_prob))
-
+		#unet_path = os.path.join(self.model_path, 'Invoice_%s-%d-%.4f-%d-%.4f.pkl' %(self.model_type,self.num_epochs,self.lr,self.num_epochs_decay,self.augmentation_prob))
+		unet_path = os.path.join(self.model_path, 'Aerial_building_dice_loss_%s-%d-%.4f-%d-%.4f.pkl' %(self.model_type,self.num_epochs,self.lr,self.num_epochs_decay,self.augmentation_prob))
 		# U-Net Train
 		if os.path.isfile(unet_path):
 			# Load the pretrained Encoder
@@ -149,12 +210,22 @@ class Solver(object):
 					SR_flat = SR_probs.view(SR_probs.size(0),-1)
 
 					GT_flat = GT.view(GT.size(0),-1)
-					loss = self.criterion(SR_flat,GT_flat)
-					epoch_loss += loss.item()
+                    
+					SR_txt = SR.permute(0, 2, 3, 1)
+					Gt_txt = GT.permute(0, 2, 3, 1)
+					training_masks = torch.ones(Gt_txt.shape)
+					selected_masks = ohem_batch(SR_txt, Gt_txt, training_masks)
+					selected_masks = Variable(selected_masks.to(self.device))
+					loss_dice = dice_loss(SR_txt, Gt_txt, selected_masks)
+                    
+					#loss = self.criterion(SR_flat,GT_flat)
+					#epoch_loss += loss.item()
+					epoch_loss += loss_dice.item()
 
 					# Backprop + optimize
 					self.reset_grad()
-					loss.backward()
+					#loss.backward()
+					loss_dice.backward()
 					self.optimizer.step()
 
 					acc += get_accuracy(SR,GT)
@@ -206,7 +277,7 @@ class Solver(object):
 
 					images = images.to(self.device)
 					GT = GT.to(self.device)
-					SR = self.unet(images)
+					SR = F.sigmoid(self.unet(images))
 					acc += get_accuracy(SR,GT)
 					SE += get_sensitivity(SR,GT)
 					SP += get_specificity(SR,GT)
@@ -242,6 +313,7 @@ class Solver(object):
 
 
 				# Save Best U-Net model
+				print("Current Score:{0}, Best Score:{1}".format(unet_score, best_unet_score))
 				if unet_score > best_unet_score:
 					best_unet_score = unet_score
 					best_epoch = epoch
@@ -270,7 +342,7 @@ class Solver(object):
 
 				images = images.to(self.device)
 				GT = GT.to(self.device)
-				SR = self.unet(images)
+				SR = F.sigmoid(self.unet(images))
 				acc += get_accuracy(SR,GT)
 				SE += get_sensitivity(SR,GT)
 				SP += get_specificity(SR,GT)
@@ -295,6 +367,85 @@ class Solver(object):
 			wr = csv.writer(f)
 			wr.writerow([self.model_type,acc,SE,SP,PC,F1,JS,DC,self.lr,best_epoch,self.num_epochs,self.num_epochs_decay,self.augmentation_prob])
 			f.close()
-			
+            
+            
 
+class SolverTest(object):
+	def __init__(self, config, test_loader = []):
+
+		# Data loader
+		self.test_loader = test_loader
+
+		# Models
+		self.unet = None
+
+		# Path
+		self.result_path = config.result_path
+
+		self.device = torch.device('cuda:{0}'.format(config.gpu_id) if config.gpu_id != -1 and torch.cuda.is_available() else 'cpu')
+		self.model_type = config.model_type
+		self.t = config.t
+		self.use_crf = config.use_crf
+		self.build_model()
+
+	def build_model(self):
+		"""Build generator and discriminator."""
+		if self.model_type =='U_Net':
+			self.unet = U_Net(img_ch=3,output_ch=1)
+		elif self.model_type =='R2U_Net':
+			self.unet = R2U_Net(img_ch=3,output_ch=1,t=self.t)
+		elif self.model_type =='AttU_Net':
+			self.unet = AttU_Net(img_ch=3,output_ch=1)
+		elif self.model_type == 'R2AttU_Net':
+			self.unet = R2AttU_Net(img_ch=3,output_ch=1,t=self.t)
 			
+		self.unet.to(self.device)
+
+		# self.print_network(self.unet, self.model_type)
+
+	def print_network(self, model, name):
+		"""Print out the network information."""
+		num_params = 0
+		for p in model.parameters():
+			num_params += p.numel()
+		print(model)
+		print(name)
+		print("The number of parameters: {}".format(num_params))
+
+	def to_data(self, x):
+		"""Convert variable to tensor."""
+		if torch.cuda.is_available():
+			x = x.cpu()
+		return x.data
+    
+	def test(self, model_path):
+		"""Test encoder, generator"""
+		#===================================== Test ====================================#
+		self.unet.load_state_dict(torch.load(model_path, map_location=self.device))
+		print('%s is Successfully Loaded from %s'%(self.model_type, model_path))
+		self.unet.train(False)
+		self.unet.eval()
+
+		for i, (images, filename) in enumerate(self.test_loader):
+			print(filename[0])
+			startTime = time.time()
+			imgTensor = images.to(self.device)
+			SR = F.sigmoid(self.unet(imgTensor))
+			SR = SR.squeeze(0).squeeze(0)
+			SR = self.to_data(SR)
+			if self.use_crf:
+				#image = Image.open("/home/root1/dataSet_wwl/segmentation/IDCard/test/images/" + filename[0])
+				image = Image.open("/home/root1/dataSet_wwl/segmentation/Aerial_building/test/images/" + filename[0])
+				#image = Image.open("/home/root1/dataSet_wwl/segmentation/Invoice/test/images/" + filename[0])
+				#image = Image.open("./images/" + filename[0])
+				out_img_model = SR.numpy() * 255
+				image = image.resize((384, 384), Image.ANTIALIAS)
+				SR = dense_crf(np.array(image).astype(np.uint8), SR)
+				out_img = SR * 255
+			else:
+				out_img = SR.numpy() * 255
+			print("Use Time: {0:0.3f}s".format(time.time() - startTime))
+			out_img = Image.fromarray(out_img.astype(np.uint8))
+			out_img.save(self.result_path + "/" + filename[0])
+			#out_img_model = Image.fromarray(out_img_model.astype(np.uint8))
+			#out_img_model.save(self.result_path + "/mask_" + filename[0])
